@@ -29,7 +29,7 @@ class BallDetector(context: Context) {
     companion object {
         private const val TAG = "BallDetector"
         private const val DEBUG_LOG = true
-        private const val SCORE_THRESHOLD = 0.15f
+        private const val SCORE_THRESHOLD = 0.08f
     }
 
     private var initError: Throwable? = null

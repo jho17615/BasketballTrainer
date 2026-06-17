@@ -5,103 +5,82 @@ import android.util.Log
 import org.opencv.core.*
 import org.opencv.imgproc.Imgproc
 
-/**
- * OpenCV HSV 컬러 트래킹 + 원형도(circularity) 검증으로 농구공을 추적한다.
- *
- * 디버깅 모드: DEBUG_LOG = true 로 두면 각 단계의 픽셀/후보 개수를
- * Logcat 태그 "BallTracker" 로 출력한다. 문제가 어느 단계에서
- * 막히는지(색 마스킹 / 면적 필터 / 원형도 필터) 확인하기 위함.
- */
 class BallTracker {
 
-    companion object {
-        private const val DEBUG_LOG = true
-    }
+    // 농구공 주황색 범위 (현재 아주 잘 잡히고 있으므로 유지)
+    private val lowerOrange = Scalar(2.0, 90.0, 80.0)
+    private val upperOrange = Scalar(20.0, 255.0, 255.0)
 
-    // 오렌지 계열 — 일단 다시 넉넉하게 설정 (디버깅 우선)
-    private val lowerOrange = Scalar(0.0,  80.0,  60.0)
-    private val upperOrange = Scalar(30.0, 255.0, 255.0)
+    fun detect(mat: Mat): RectF? {
+        val hsv = Mat()
+        val mask = Mat()
 
-    private val hsvMat  = Mat()
-    private val maskMat = Mat()
-    private val kernel  = Imgproc.getStructuringElement(
-        Imgproc.MORPH_ELLIPSE, Size(9.0, 9.0)
-    )
-
-    private val minCircularity = 0.5
-
-    fun detect(rgbaMat: Mat, minRadiusPx: Float = 18f): RectF? {
-        Imgproc.cvtColor(rgbaMat, hsvMat, Imgproc.COLOR_RGBA2RGB)
-        Imgproc.cvtColor(hsvMat,  hsvMat, Imgproc.COLOR_RGB2HSV)
-        Core.inRange(hsvMat, lowerOrange, upperOrange, maskMat)
-
-        val maskPixels = Core.countNonZero(maskMat)
-        if (DEBUG_LOG) Log.d("BallTracker", "1) mask nonzero pixels = $maskPixels / total ${maskMat.rows() * maskMat.cols()}")
-
-        if (maskPixels == 0) return null
-
-        Imgproc.morphologyEx(maskMat, maskMat, Imgproc.MORPH_OPEN,  kernel)
-        Imgproc.morphologyEx(maskMat, maskMat, Imgproc.MORPH_CLOSE, kernel)
-
-        val afterMorph = Core.countNonZero(maskMat)
-        if (DEBUG_LOG) Log.d("BallTracker", "2) after morphology nonzero = $afterMorph")
-
-        val contours = ArrayList<MatOfPoint>()
-        Imgproc.findContours(
-            maskMat, contours, Mat(),
-            Imgproc.RETR_EXTERNAL, Imgproc.CHAIN_APPROX_SIMPLE
-        )
-        if (DEBUG_LOG) Log.d("BallTracker", "3) contours found = ${contours.size}")
-        if (contours.isEmpty()) return null
-
-        val candidates = contours
-            .map { it to Imgproc.contourArea(it) }
-            .filter { it.second >= Math.PI * minRadiusPx * minRadiusPx }
-            .sortedByDescending { it.second }
-            .take(3)
-
-        if (DEBUG_LOG) Log.d("BallTracker", "4) candidates after area filter = ${candidates.size}, areas = ${candidates.map { it.second }}")
-        if (candidates.isEmpty()) return null
-
-        var best: MatOfPoint? = null
-        var bestCircularity = 0.0
-
-        for ((contour, area) in candidates) {
-            val perimeter = Imgproc.arcLength(MatOfPoint2f(*contour.toArray()), true)
-            if (perimeter <= 0.0) continue
-            val circularity = 4 * Math.PI * area / (perimeter * perimeter)
-            if (DEBUG_LOG) Log.d("BallTracker", "5) candidate area=$area perimeter=$perimeter circularity=$circularity")
-            if (circularity >= minCircularity && circularity > bestCircularity) {
-                bestCircularity = circularity
-                best = contour
+        try {
+            if (mat.channels() == 4) {
+                Imgproc.cvtColor(mat, hsv, Imgproc.COLOR_RGBA2RGB)
+                Imgproc.cvtColor(hsv, hsv, Imgproc.COLOR_RGB2HSV)
+            } else {
+                Imgproc.cvtColor(mat, hsv, Imgproc.COLOR_RGB2HSV)
             }
-        }
 
-        val selected = best ?: run {
-            if (DEBUG_LOG) Log.d("BallTracker", "6) no candidate passed circularity >= $minCircularity")
+            Core.inRange(hsv, lowerOrange, upperOrange, mask)
+
+            // 모폴로지 연산으로 자잘한 조명 노이즈 제거
+            val kernel = Imgproc.getStructuringElement(Imgproc.MORPH_ELLIPSE, Size(5.0, 5.0))
+            Imgproc.morphologyEx(mask, mask, Imgproc.MORPH_OPEN, kernel)
+            kernel.release()
+
+            val contours = mutableListOf<MatOfPoint>()
+            Imgproc.findContours(mask, contours, Mat(), Imgproc.RETR_EXTERNAL, Imgproc.CHAIN_APPROX_SIMPLE)
+
+            var bestContour: MatOfPoint? = null
+            var maxArea = 0.0
+
+            for (contour in contours) {
+                val area = Imgproc.contourArea(contour)
+
+                // 📌 [튜닝 1] 최소 면적 완화
+                // 멀리 떨어지거나 빠른 이동으로 흐려진 공도 잡을 수 있도록 최소 면적을 150에서 70으로 낮춥니다.
+                if (area > 40000.0 || area < 70.0) continue
+
+                val rect = Imgproc.boundingRect(contour)
+                val aspectRatio = rect.width.toFloat() / rect.height.toFloat()
+
+                // 📌 [📌 핵심 튜닝 2] 가로세로 비율(Aspect Ratio) 제약 대폭 완화
+                // 드리블/슛을 할 때 공이 위아래나 좌우로 길게 늘어나는 '모션 블러' 현상을 수용합니다.
+                // 기존 0.65~1.45 -> 변경 0.45~2.20 (길쭉해진 공도 농구공으로 인정)
+                if (aspectRatio < 0.45f || aspectRatio > 2.20f) continue
+
+                if (area > maxArea) {
+                    maxArea = area
+                    bestContour = contour
+                }
+            }
+
+            if (bestContour == null) {
+                return null
+            }
+
+            val rect = Imgproc.boundingRect(bestContour)
+            Log.d("BallTracker", "🎯 [추적 성공] X: ${rect.x}, Y: ${rect.y}, W: ${rect.width}, H: ${rect.height} (면적: $maxArea)")
+
+            return RectF(
+                rect.x.toFloat(),
+                rect.y.toFloat(),
+                (rect.x + rect.width).toFloat(),
+                (rect.y + rect.height).toFloat()
+            )
+
+        } catch (e: Exception) {
+            Log.e("BallTracker", "🚨 에러 발생: ${e.message}", e)
             return null
+        } finally {
+            hsv.release()
+            mask.release()
         }
-
-        val point2f = MatOfPoint2f(*selected.toArray())
-        val center  = Point()
-        val radius  = FloatArray(1)
-        Imgproc.minEnclosingCircle(point2f, center, radius)
-
-        val r = radius[0]
-        if (DEBUG_LOG) Log.d("BallTracker", "7) selected circle center=$center radius=$r")
-        if (r < minRadiusPx) return null
-
-        return RectF(
-            (center.x - r).toFloat(),
-            (center.y - r).toFloat(),
-            (center.x + r).toFloat(),
-            (center.y + r).toFloat(),
-        )
     }
 
     fun release() {
-        hsvMat.release()
-        maskMat.release()
-        kernel.release()
+        Log.d("BallTracker", "BallTracker 자원 해제 완료")
     }
 }

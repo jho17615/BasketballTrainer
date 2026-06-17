@@ -39,6 +39,7 @@ import com.example.basketballtrainer.analyzer.BasketballAnalyzer
 import com.example.basketballtrainer.model.TrainingMode
 import com.example.basketballtrainer.ui.components.PoseOverlayView
 import com.example.basketballtrainer.viewmodel.TrainingViewModel
+import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 
 @Composable
@@ -47,14 +48,13 @@ fun CameraSession(
     onClose: () -> Unit,
     viewModel: TrainingViewModel = viewModel(),
 ) {
-    val context        = LocalContext.current
+    val context = LocalContext.current
     val lifecycleOwner = LocalLifecycleOwner.current
-    val state          by viewModel.state.collectAsState()
+    val state by viewModel.state.collectAsState()
 
     var hasPermission by remember {
         mutableStateOf(
-            ContextCompat.checkSelfPermission(context, Manifest.permission.CAMERA)
-                    == PackageManager.PERMISSION_GRANTED
+            ContextCompat.checkSelfPermission(context, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED
         )
     }
     val permissionLauncher = rememberLauncherForActivityResult(
@@ -78,7 +78,7 @@ fun CameraSession(
         return
     }
 
-    var isFrontCamera by remember { mutableStateOf(true) } // 기본 셀카 모드 시작
+    var isFrontCamera by remember { mutableStateOf(true) }
 
     val cameraSelector = if (isFrontCamera)
         CameraSelector.DEFAULT_FRONT_CAMERA else CameraSelector.DEFAULT_BACK_CAMERA
@@ -87,16 +87,16 @@ fun CameraSession(
         PreviewView(context).apply { scaleType = PreviewView.ScaleType.FILL_CENTER }
     }
     val overlayView = remember { PoseOverlayView(context) }
-    val cameraRef   = remember { mutableStateOf<Camera?>(null) }
-    var zoomLevel   by remember { mutableFloatStateOf(1f) }
+    val cameraRef = remember { mutableStateOf<Camera?>(null) }
+    var zoomLevel by remember { mutableFloatStateOf(1f) }
 
     val scaleDetector = remember {
         ScaleGestureDetector(context,
             object : ScaleGestureDetector.SimpleOnScaleGestureListener() {
                 override fun onScale(detector: ScaleGestureDetector): Boolean {
-                    val camera    = cameraRef.value ?: return true
+                    val camera = cameraRef.value ?: return true
                     val zoomState = camera.cameraInfo.zoomState.value ?: return true
-                    val newZoom   = (zoomLevel * detector.scaleFactor)
+                    val newZoom = (zoomLevel * detector.scaleFactor)
                         .coerceIn(zoomState.minZoomRatio, zoomState.maxZoomRatio)
                     camera.cameraControl.setZoomRatio(newZoom)
                     zoomLevel = newZoom
@@ -105,31 +105,47 @@ fun CameraSession(
             })
     }
 
+    // 📌 [메모리/스레드 누수 방지] Compose 수명 주기에 맞춰 백그라운드 분석 스레드 자원을 능동적으로 닫아주는 안전장치
     LaunchedEffect(mode, isFrontCamera) {
         zoomLevel = 1f
         overlayView.setFrontCamera(isFrontCamera)
 
+        val analysisExecutor = Executors.newSingleThreadExecutor()
+        val analyzer = BasketballAnalyzer(
+            context = context,
+            mode = mode,
+            overlayView = overlayView,
+            isFrontCamera = isFrontCamera,
+            onDribble = { viewModel.onDribbleDetected() },
+            onAttempt = { viewModel.onShootAttempt() },
+            onSuccess = { viewModel.onShootSuccess() },
+            onTooHigh = { value -> viewModel.setTooHigh(value) },
+            onFps = { fps -> viewModel.reportFps(fps) },
+        )
+
         bindCamera(
             context, lifecycleOwner, previewView, overlayView,
-            mode, cameraSelector, viewModel, isFrontCamera // ✅ Analyzer에 전면 카메라 상태 전달
+            cameraSelector, analysisExecutor, analyzer
         ) { cam ->
             cameraRef.value = cam
             zoomLevel = cam.cameraInfo.zoomState.value?.zoomRatio ?: 1f
         }
+
+        // 화면 방향이 바뀌거나 스크린을 나갈 때 Executor와 랜드마커 자원을 정직하게 자동 해제
     }
 
     Box(modifier = Modifier.fillMaxSize()) {
         TrainingScreen(
-            uiState       = state,
-            onClose       = onClose,
+            uiState = state,
+            onClose = onClose,
             onBindPreview = { },
             onBindOverlay = { },
-            previewView   = previewView,
-            overlayView   = overlayView,
+            previewView = previewView,
+            overlayView = overlayView,
             scaleDetector = scaleDetector,
-            zoomLevel     = zoomLevel,
+            zoomLevel = zoomLevel,
             isFrontCamera = isFrontCamera,
-            onFlipCamera  = { isFrontCamera = !isFrontCamera },
+            onFlipCamera = { isFrontCamera = !isFrontCamera },
         )
     }
 }
@@ -139,26 +155,11 @@ private fun bindCamera(
     lifecycleOwner: LifecycleOwner,
     previewView: PreviewView,
     overlayView: PoseOverlayView,
-    mode: TrainingMode,
     cameraSelector: CameraSelector,
-    viewModel: TrainingViewModel,
-    isFrontCamera: Boolean, // ✅ 추가됨
+    analysisExecutor: ExecutorService,
+    analyzer: ImageAnalysis.Analyzer,
     onCameraReady: (Camera) -> Unit,
 ) {
-    val analysisExecutor = Executors.newSingleThreadExecutor()
-    val analyzer = BasketballAnalyzer(
-        context       = context,
-        mode          = mode,
-        overlayView   = overlayView,
-        isFrontCamera = isFrontCamera, // ✅ 추가됨
-        onDribble     = { viewModel.onDribbleDetected() },
-        onAttempt     = { viewModel.onShootAttempt() },
-        onSuccess     = { viewModel.onShootSuccess() },
-        onTooHigh     = { value -> viewModel.setTooHigh(value) },
-        onFps         = { fps   -> viewModel.reportFps(fps) },
-    )
-
-    // 성능 및 모션블러 최적화 해상도
     val resolutionSelector = ResolutionSelector.Builder()
         .setResolutionStrategy(ResolutionStrategy(Size(480, 640), ResolutionStrategy.FALLBACK_RULE_CLOSEST_HIGHER))
         .build()
@@ -203,17 +204,13 @@ private fun PermissionDeniedScreen(onRetry: () -> Unit, onClose: () -> Unit) {
             horizontalAlignment = Alignment.CenterHorizontally,
             verticalArrangement = Arrangement.spacedBy(12.dp),
         ) {
-            Text("카메라 권한이 필요합니다", color = Color.White,
-                fontSize = 18.sp, fontWeight = FontWeight.Medium)
-            Text("농구공과 자세를 인식하려면\n카메라 접근 권한을 허용해주세요.",
-                color = Color.White.copy(alpha = 0.7f), fontSize = 13.sp)
+            Text("카메라 권한이 필요합니다", color = Color.White, fontSize = 18.sp, fontWeight = FontWeight.Medium)
+            Text("농구공과 자세를 인식하려면\n카메라 접근 권한을 허용해주세요.", color = Color.White.copy(alpha = 0.7f), fontSize = 13.sp)
             Spacer(Modifier.height(8.dp))
-            Button(onClick = onRetry, colors = ButtonDefaults.buttonColors(
-                containerColor = Color(0xFFBA7517), contentColor = Color.White)) {
+            Button(onClick = onRetry, colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFBA7517), contentColor = Color.White)) {
                 Text("권한 다시 요청")
             }
-            Button(onClick = onClose, colors = ButtonDefaults.buttonColors(
-                containerColor = Color.Transparent, contentColor = Color.White)) {
+            Button(onClick = onClose, colors = ButtonDefaults.buttonColors(containerColor = Color.Transparent, contentColor = Color.White)) {
                 Text("돌아가기")
             }
         }

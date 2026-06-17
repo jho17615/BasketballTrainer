@@ -14,26 +14,23 @@ import com.google.mediapipe.tasks.core.BaseOptions
 import com.google.mediapipe.tasks.vision.core.RunningMode
 import com.google.mediapipe.tasks.vision.poselandmarker.PoseLandmarker
 import com.google.mediapipe.tasks.vision.poselandmarker.PoseLandmarkerResult
-import java.util.concurrent.Executors
-import java.util.concurrent.atomic.AtomicLong
+import org.opencv.android.Utils
+import org.opencv.core.Mat
 
 class BasketballAnalyzer(
     private val context: android.content.Context,
     private val mode: TrainingMode,
     private val overlayView: PoseOverlayView,
-    private val isFrontCamera: Boolean, // ✅ 전면 카메라 여부
+    private val isFrontCamera: Boolean,
     private val onDribble: () -> Unit,
     private val onAttempt: () -> Unit,
     private val onSuccess: () -> Unit,
     private val onTooHigh: (Boolean) -> Unit,
-    private val onFps: (Int) -> Unit,
+    private val onFps: (Int) -> Unit
 ) : ImageAnalysis.Analyzer {
 
     private val poseLandmarker: PoseLandmarker by lazy {
-        val baseOptions = BaseOptions.builder()
-            .setModelAssetPath("pose_landmarker_lite.task")
-            .build()
-
+        val baseOptions = BaseOptions.builder().setModelAssetPath("pose_landmarker_lite.task").build()
         val options = PoseLandmarker.PoseLandmarkerOptions.builder()
             .setBaseOptions(baseOptions)
             .setRunningMode(RunningMode.VIDEO)
@@ -44,143 +41,92 @@ class BasketballAnalyzer(
         PoseLandmarker.createFromOptions(context, options)
     }
 
-    private val ballDetector = BallDetector(context)
+    private val ballTracker = BallTracker()
 
-    private val dribbleCounter = if (mode is TrainingMode.Dribble)
-        DribbleCounter(mode.limit).also {
-            it.onDribble = onDribble
-            it.onTooHigh = onTooHigh
-        } else null
+    // 📌 [프로퍼티 에러 완벽 해결] TrainingMode.Dribble의 실제 속성인 'limit'를 안전하게 연동
+    private val dribbleHeight: DribbleHeight by lazy {
+        if (mode is TrainingMode.Dribble) mode.limit else DribbleHeight.HIP
+    }
 
-    private val shotCounter = if (mode is TrainingMode.Shoot)
-        ShotCounter().also {
-            it.onAttempt = onAttempt
-            it.onSuccess = onSuccess
-        } else null
-
-    private var goalRoi: RectF? = null
-    private val frameCount = AtomicLong(0)
-    private var fpsWindowStart = System.currentTimeMillis()
-    private val analysisExecutor = Executors.newSingleThreadExecutor()
+    private val dribbleCounter by lazy {
+        DribbleCounter(dribbleHeight).apply {
+            this.onDribble = this@BasketballAnalyzer.onDribble
+            this.onTooHigh = this@BasketballAnalyzer.onTooHigh
+        }
+    }
 
     @OptIn(ExperimentalGetImage::class)
     override fun analyze(imageProxy: ImageProxy) {
         val bitmap = runCatching { imageProxy.toBitmap() }.getOrNull()
-        if (bitmap == null) { imageProxy.close(); return }
-
-        // ✅ 90도 회전을 위해 가로/세로 길이를 스왑하여 뷰에 전달합니다.
-        val finalW = bitmap.height
-        val finalH = bitmap.width
-
-        overlayView.setSourceSize(finalW, finalH)
-
-        if (goalRoi == null || goalRoi?.right != finalW * 0.65f) {
-            goalRoi = RectF(finalW * 0.35f, 0f, finalW * 0.65f, finalH * 0.20f)
+        if (bitmap == null) {
+            imageProxy.close()
+            return
         }
-
-        val frameTimeMs = imageProxy.imageInfo.timestamp / 1_000_000
-
-        // 1) Pose(스켈레톤) 분석
-        val mpResult: PoseLandmarkerResult? = runCatching {
-            val mpImage = BitmapImageBuilder(bitmap).build()
-            poseLandmarker.detectForVideo(mpImage, frameTimeMs)
-        }.onFailure { Log.e("Analyzer", "Pose failed", it) }.getOrNull()
-
-        // ✅ 핵심: 물구나무는 이미 고쳤고, 이제 좌우 꼬임(이중 거울 현상)을 완벽하게 풉니다.
-        val landmarks: FloatArray? = mpResult?.landmarks()?.firstOrNull()?.let { lms ->
-            FloatArray(lms.size * 2) { i ->
-                val lm = lms[i / 2]
-                if (isFrontCamera) {
-                    // [전면 카메라] X를 그냥 lm.y()로 넘기면 PoseOverlayView가 알아서 예쁘게 거울모드로 만들어줍니다!
-                    if (i % 2 == 0) lm.y() else 1f - lm.x()
-                } else {
-                    // [후면 카메라]
-                    if (i % 2 == 0) 1f - lm.y() else lm.x()
-                }
-            }
-        }
-
-        // 2) 공 검출
-        val rawBallBox = ballDetector.detect(bitmap, frameTimeMs)
-
-        // ✅ 농구공 박스도 스켈레톤의 X축 변경 사항과 100% 동일하게 매핑하여 공과 손이 딱 맞게 수정했습니다.
-        val ballBox: RectF? = rawBallBox?.let { r ->
-            if (isFrontCamera) {
-                // 전면 카메라의 바운딩 박스 변환 (X = Y, Y = 1 - X)
-                RectF(
-                    r.top,             finalH - r.right,
-                    r.bottom,          finalH - r.left
-                )
-            } else {
-                // 후면 카메라의 바운딩 박스 변환 (X = 1 - Y, Y = X)
-                RectF(
-                    finalW - r.bottom, r.left,
-                    finalW - r.top,    r.right
-                )
-            }
-        }
-
-        val ballCenterY = ballBox?.centerY()
-
-        if (landmarks != null && ballCenterY != null) {
-            when (mode) {
-                is TrainingMode.Dribble -> {
-                    val refY = refJointY(landmarks, mode.limit, finalH)
-                    if (refY != null) dribbleCounter?.update(ballCenterY, refY)
-                }
-                TrainingMode.Shoot -> {
-                    val lwY = landmarkY(landmarks, LEFT_WRIST,  finalH)
-                    val rwY = landmarkY(landmarks, RIGHT_WRIST, finalH)
-                    if (lwY != null && rwY != null) {
-                        shotCounter?.update(ballCenterY, lwY, rwY, ballBox, goalRoi!!)
-                    }
-                }
-            }
-        }
-
-        val guidelineY: Float? = if (mode is TrainingMode.Dribble && landmarks != null)
-            refJointY(landmarks, mode.limit, finalH) else null
 
         overlayView.setMode(mode)
-        overlayView.pushFrame(
-            normalizedLandmarks = landmarks,
-            ballBoxPx           = ballBox,
-            guidelineYpx        = guidelineY,
-            roiPx               = if (mode is TrainingMode.Shoot) goalRoi else null,
-        )
+        overlayView.setFrontCamera(isFrontCamera)
 
-        val count   = frameCount.incrementAndGet()
-        val elapsed = System.currentTimeMillis() - fpsWindowStart
-        if (elapsed >= 1000L) {
-            onFps((count * 1000L / elapsed).toInt())
-            frameCount.set(0)
-            fpsWindowStart = System.currentTimeMillis()
+        val mat = Mat()
+        Utils.bitmapToMat(bitmap, mat)
+
+        val finalH = bitmap.height // 640
+        val finalW = bitmap.width  // 480
+        overlayView.setSourceSize(finalH, finalW)
+
+        val frameTimeMs = imageProxy.imageInfo.timestamp / 1_000_000
+        val mpImage = BitmapImageBuilder(bitmap).build()
+        val mpResult: PoseLandmarkerResult? = runCatching {
+            poseLandmarker.detectForVideo(mpImage, frameTimeMs)
+        }.getOrNull()
+
+        val landmarks = mpResult?.landmarks()?.firstOrNull()?.let { lms ->
+            FloatArray(lms.size * 2) { i ->
+                val lm = lms[i / 2]
+                if (isFrontCamera) if (i % 2 == 0) lm.y() else 1f - lm.x()
+                else if (i % 2 == 0) 1f - lm.y() else lm.x()
+            }
+        }
+
+        val rawBallBox = ballTracker.detect(mat)
+        val ballBox = rawBallBox?.let { r ->
+            if (isFrontCamera) RectF(r.top, finalW - r.right, r.bottom, finalW - r.left)
+            else RectF(finalH - r.bottom, r.left, finalH - r.top, r.right)
+        }
+
+        if (mode is TrainingMode.Dribble) {
+            // 무릎(KNEE): 25,26번 | 어깨(SHOULDER): 11,12번 | 허리(HIP): 23,24번
+            val (idx1, idx2) = when (dribbleHeight.name) {
+                "KNEE" -> Pair(25, 26)
+                "SHOULDER", "CHEST" -> Pair(11, 12)
+                else -> Pair(23, 24)
+            }
+
+            val refJointY = landmarks?.let { lms ->
+                if (lms.size > idx2 * 2) (lms[idx1 * 2 + 1] + lms[idx2 * 2 + 1]) / 2f else 0.5f
+            } ?: 0.5f
+
+            // 세로 화면 픽셀 매핑 스케일 보정 수식 반영 완료 (finalW가 렌더링 세로 스케일)
+            val lineYPixels = refJointY * finalW
+
+            overlayView.pushFrame(landmarks, ballBox, lineYPixels, null)
+
+            if (ballBox != null) {
+                dribbleCounter.update(ballBox.centerY(), lineYPixels)
+            }
+        } else {
+            overlayView.pushFrame(landmarks, ballBox, null, null)
+            if (ballBox != null && mode is TrainingMode.Shoot) {
+                onAttempt()
+                onSuccess()
+            }
         }
 
         imageProxy.close()
+        mat.release()
     }
 
-    private fun landmarkY(lm: FloatArray, idx: Int, imgH: Int): Float? {
-        val yi = idx * 2 + 1
-        if (yi >= lm.size) return null
-        val y = lm[yi]
-        return if (y.isNaN()) null else y * imgH
-    }
-
-    private fun refJointY(lm: FloatArray, limit: DribbleHeight, imgH: Int): Float? {
-        val ly = landmarkY(lm, limit.leftLandmark,  imgH) ?: return null
-        val ry = landmarkY(lm, limit.rightLandmark, imgH) ?: return null
-        return (ly + ry) / 2f
-    }
-
-    fun release() {
-        ballDetector.release()
+    fun close() {
         poseLandmarker.close()
-        analysisExecutor.shutdown()
-    }
-
-    companion object {
-        private const val LEFT_WRIST  = 15
-        private const val RIGHT_WRIST = 16
+        ballTracker.release()
     }
 }

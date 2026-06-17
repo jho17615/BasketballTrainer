@@ -78,7 +78,8 @@ fun CameraSession(
         return
     }
 
-    var isFrontCamera by remember { mutableStateOf(false) }
+    var isFrontCamera by remember { mutableStateOf(true) } // 기본 셀카 모드 시작
+
     val cameraSelector = if (isFrontCamera)
         CameraSelector.DEFAULT_FRONT_CAMERA else CameraSelector.DEFAULT_BACK_CAMERA
 
@@ -107,27 +108,30 @@ fun CameraSession(
     LaunchedEffect(mode, isFrontCamera) {
         zoomLevel = 1f
         overlayView.setFrontCamera(isFrontCamera)
+
         bindCamera(
             context, lifecycleOwner, previewView, overlayView,
-            mode, cameraSelector, viewModel
+            mode, cameraSelector, viewModel, isFrontCamera // ✅ Analyzer에 전면 카메라 상태 전달
         ) { cam ->
             cameraRef.value = cam
             zoomLevel = cam.cameraInfo.zoomState.value?.zoomRatio ?: 1f
         }
     }
 
-    TrainingScreen(
-        uiState       = state,
-        onClose       = onClose,
-        onBindPreview = { },
-        onBindOverlay = { },
-        previewView   = previewView,
-        overlayView   = overlayView,
-        scaleDetector = scaleDetector,
-        zoomLevel     = zoomLevel,
-        isFrontCamera = isFrontCamera,
-        onFlipCamera  = { isFrontCamera = !isFrontCamera },
-    )
+    Box(modifier = Modifier.fillMaxSize()) {
+        TrainingScreen(
+            uiState       = state,
+            onClose       = onClose,
+            onBindPreview = { },
+            onBindOverlay = { },
+            previewView   = previewView,
+            overlayView   = overlayView,
+            scaleDetector = scaleDetector,
+            zoomLevel     = zoomLevel,
+            isFrontCamera = isFrontCamera,
+            onFlipCamera  = { isFrontCamera = !isFrontCamera },
+        )
+    }
 }
 
 private fun bindCamera(
@@ -138,25 +142,25 @@ private fun bindCamera(
     mode: TrainingMode,
     cameraSelector: CameraSelector,
     viewModel: TrainingViewModel,
+    isFrontCamera: Boolean, // ✅ 추가됨
     onCameraReady: (Camera) -> Unit,
 ) {
     val analysisExecutor = Executors.newSingleThreadExecutor()
     val analyzer = BasketballAnalyzer(
-        context     = context,
-        mode        = mode,
-        overlayView = overlayView,
-        onDribble   = { viewModel.onDribbleDetected() },
-        onAttempt   = { viewModel.onShootAttempt() },
-        onSuccess   = { viewModel.onShootSuccess() },
-        onTooHigh   = { value -> viewModel.setTooHigh(value) },
-        onFps       = { fps   -> viewModel.reportFps(fps) },
+        context       = context,
+        mode          = mode,
+        overlayView   = overlayView,
+        isFrontCamera = isFrontCamera, // ✅ 추가됨
+        onDribble     = { viewModel.onDribbleDetected() },
+        onAttempt     = { viewModel.onShootAttempt() },
+        onSuccess     = { viewModel.onShootSuccess() },
+        onTooHigh     = { value -> viewModel.setTooHigh(value) },
+        onFps         = { fps   -> viewModel.reportFps(fps) },
     )
 
-    // 분석용 해상도: 480x640 고정 — 발열/연산량 최적화
+    // 성능 및 모션블러 최적화 해상도
     val resolutionSelector = ResolutionSelector.Builder()
-        .setResolutionStrategy(
-            ResolutionStrategy(Size(480, 640), ResolutionStrategy.FALLBACK_RULE_CLOSEST_HIGHER)
-        )
+        .setResolutionStrategy(ResolutionStrategy(Size(480, 640), ResolutionStrategy.FALLBACK_RULE_CLOSEST_HIGHER))
         .build()
 
     val preview = Preview.Builder()

@@ -17,20 +17,11 @@ import com.google.mediapipe.tasks.vision.poselandmarker.PoseLandmarkerResult
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicLong
 
-/**
- * CameraX ImageAnalysis.Analyzer.
- *
- * 확정 사양:
- *  - MediaPipe Pose Landmarker (RunningMode.VIDEO) — 관절 추적
- *  - MediaPipe Object Detector (EfficientDet-Lite0, "sports ball" 카테고리) — 공 추적
- *    → 색상 기반(OpenCV HSV) 대신 모양/특징 기반 탐지로 전환.
- *      피부색, 옷, 조명에 흔들리지 않음.
- *  - 좌표는 (1 - y, x) 매핑으로 90도 회전 + 반전 보정
- */
 class BasketballAnalyzer(
     private val context: android.content.Context,
     private val mode: TrainingMode,
     private val overlayView: PoseOverlayView,
+    private val isFrontCamera: Boolean, // ✅ 전면 카메라 여부
     private val onDribble: () -> Unit,
     private val onAttempt: () -> Unit,
     private val onSuccess: () -> Unit,
@@ -42,6 +33,7 @@ class BasketballAnalyzer(
         val baseOptions = BaseOptions.builder()
             .setModelAssetPath("pose_landmarker_lite.task")
             .build()
+
         val options = PoseLandmarker.PoseLandmarkerOptions.builder()
             .setBaseOptions(baseOptions)
             .setRunningMode(RunningMode.VIDEO)
@@ -76,42 +68,58 @@ class BasketballAnalyzer(
         val bitmap = runCatching { imageProxy.toBitmap() }.getOrNull()
         if (bitmap == null) { imageProxy.close(); return }
 
-        // 회전 + 좌우 보정된 최종 표시 크기
+        // ✅ 90도 회전을 위해 가로/세로 길이를 스왑하여 뷰에 전달합니다.
         val finalW = bitmap.height
         val finalH = bitmap.width
 
         overlayView.setSourceSize(finalW, finalH)
 
-        if (goalRoi == null) {
+        if (goalRoi == null || goalRoi?.right != finalW * 0.65f) {
             goalRoi = RectF(finalW * 0.35f, 0f, finalW * 0.65f, finalH * 0.20f)
         }
 
         val frameTimeMs = imageProxy.imageInfo.timestamp / 1_000_000
 
-        // 1) Pose 분석
+        // 1) Pose(스켈레톤) 분석
         val mpResult: PoseLandmarkerResult? = runCatching {
             val mpImage = BitmapImageBuilder(bitmap).build()
             poseLandmarker.detectForVideo(mpImage, frameTimeMs)
         }.onFailure { Log.e("Analyzer", "Pose failed", it) }.getOrNull()
 
+        // ✅ 핵심: 물구나무는 이미 고쳤고, 이제 좌우 꼬임(이중 거울 현상)을 완벽하게 풉니다.
         val landmarks: FloatArray? = mpResult?.landmarks()?.firstOrNull()?.let { lms ->
             FloatArray(lms.size * 2) { i ->
                 val lm = lms[i / 2]
-                if (i % 2 == 0) 1f - lm.y() else lm.x()
+                if (isFrontCamera) {
+                    // [전면 카메라] X를 그냥 lm.y()로 넘기면 PoseOverlayView가 알아서 예쁘게 거울모드로 만들어줍니다!
+                    if (i % 2 == 0) lm.y() else 1f - lm.x()
+                } else {
+                    // [후면 카메라]
+                    if (i % 2 == 0) 1f - lm.y() else lm.x()
+                }
             }
         }
 
-        // 2) 공 검출 (MediaPipe Object Detector, bitmap 원본 좌표계)
+        // 2) 공 검출
         val rawBallBox = ballDetector.detect(bitmap, frameTimeMs)
 
-        // bitmap(원본) 좌표 → 회전 보정된 표시 좌표로 변환
-        // 회전 매핑: displayX = bitmap.height - rawY, displayY = rawX
+        // ✅ 농구공 박스도 스켈레톤의 X축 변경 사항과 100% 동일하게 매핑하여 공과 손이 딱 맞게 수정했습니다.
         val ballBox: RectF? = rawBallBox?.let { r ->
-            RectF(
-                finalW - r.bottom, r.left,
-                finalW - r.top,    r.right,
-            )
+            if (isFrontCamera) {
+                // 전면 카메라의 바운딩 박스 변환 (X = Y, Y = 1 - X)
+                RectF(
+                    r.top,             finalH - r.right,
+                    r.bottom,          finalH - r.left
+                )
+            } else {
+                // 후면 카메라의 바운딩 박스 변환 (X = 1 - Y, Y = X)
+                RectF(
+                    finalW - r.bottom, r.left,
+                    finalW - r.top,    r.right
+                )
+            }
         }
+
         val ballCenterY = ballBox?.centerY()
 
         if (landmarks != null && ballCenterY != null) {
